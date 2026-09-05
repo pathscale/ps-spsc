@@ -36,8 +36,10 @@ jobs:
           components: miri
       - uses: Swatinem/rust-cache@v2
 
-      # The queue is a hand-written ring with raw pointer copies in pop_n and
-      # a manual dealloc in Drop. Native tests do not see a mistake there.
+      # The queue is a hand-written ring: pop_n does raw segmented copies and Drop
+      # deallocates by hand. A native run cannot see an out-of-bounds read there,
+      # and did not: planting `let (lo, hi) = (s, d)` in the equivalent st3 path
+      # was a bare SIGBUS natively and a located diagnostic under Miri.
+      #
+      # Fixtures are sized by cfg(miri) so this stays a few seconds, not minutes.
       - run: cargo miri test --lib
-        env:
-          MIRIFLAGS: -Zmiri-disable-isolation

@@ -666,6 +666,21 @@ mod tests {
     use std::thread;
     use std::vec::Vec;
 
+    // Miri interprets every memory access, so the native fixtures do not finish
+    // under it: test_pop_n is 250,000 pops and test_threaded is 100,000. What these
+    // tests are actually about is wrap-around and the drop of overwritten values,
+    // and neither of those needs volume, so the fixture shrinks rather than the
+    // budget growing.
+    #[cfg(miri)]
+    const POP_N_ROUNDS: usize = 4;
+    #[cfg(not(miri))]
+    const POP_N_ROUNDS: usize = 500;
+
+    #[cfg(miri)]
+    const THREADED_ITEMS: i32 = 400;
+    #[cfg(not(miri))]
+    const THREADED_ITEMS: i32 = 100_000;
+
     #[test]
     fn test_buffer_size() {
         assert_eq!(::std::mem::size_of::<Buffer<()>>(), 3 * CACHELINE_LEN);
@@ -780,7 +795,7 @@ mod tests {
     fn test_pop_n() {
         {
             let (p, c) = super::make(500);
-            for _ in 0..500 {
+            for _ in 0..POP_N_ROUNDS {
                 for i in 0..500 {
                     p.push(i)
                 }
@@ -904,12 +919,12 @@ mod tests {
         let (p, c) = super::make(500);
 
         thread::spawn(move || {
-            for i in 0..100000 {
+            for i in 0..THREADED_ITEMS {
                 p.push(i);
             }
         });
 
-        for i in 0..100000 {
+        for i in 0..THREADED_ITEMS {
             let t = c.pop();
             assert!(t == i);
         }
