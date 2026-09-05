@@ -5,8 +5,8 @@ authors = ["Zachary Tong <zacharyjtong@gmail.com>"]
 license = "Apache-2.0"
 description = "A bounded SPSC queue"
 
-repository = "https://github.com/pathscale/bounded-spsc-queue"
-homepage = "https://github.com/pathscale/bounded-spsc-queue"
+repository = "https://github.com/pathscale/ps-spsc"
+homepage = "https://github.com/pathscale/ps-spsc"
 documentation = "https://docs.rs/ps-spsc"
 keywords = ["data-structures"]
 readme = "README.md"

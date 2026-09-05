@@ -42,7 +42,7 @@ success.
 
 ## PR discipline
 
-**Always paste the full PR URL** (`https://github.com/pathscale/bounded-spsc-queue/pull/<n>`), not just the number, so it's
+**Always paste the full PR URL** (`https://github.com/pathscale/ps-spsc/pull/<n>`), not just the number, so it's
 clickable.
 
 <!-- DORMANT — CI-green gating. Do not follow this rule yet; re-enable it as its own project.
@@ -57,7 +57,7 @@ uncomment the rule below.
     After any push or PR, **check CI and don't call it done until it's green**:
 
     ```bash
-    gh pr view <number> --repo pathscale/bounded-spsc-queue --json statusCheckRollup
+    gh pr view <number> --repo pathscale/ps-spsc --json statusCheckRollup
     ```
 
     CI running → wait and recheck. CI failed → read the logs, fix, push, wait for green.
