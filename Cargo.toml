@@ -11,6 +11,9 @@ documentation = "https://docs.rs/ps-spsc"
 keywords = ["data-structures"]
 readme = "README.md"
 
+# Benchmark plots and agent instructions are repository furniture, not crate content.
+exclude = ["*.png", ".claude/", ".github/", "AGENTS.md", "CLAUDE.md"]
+
 
 
 [lib]
