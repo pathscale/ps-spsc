@@ -152,6 +152,59 @@ impl<T> Buffer<T> {
         diff
     }
 
+    /// Pop up to `target.len()` values off the buffer in one go, returning how many moved.
+    ///
+    /// The slots in `target` hold values the caller owns, and assigning to one would drop it,
+    /// so this drops them too before overwriting. For a `T` with no destructor that loop
+    /// compiles away and this is two `copy_nonoverlapping` calls.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut target = [0; 1024];
+    /// let popped = buffer.pop_n(&mut target);
+    /// ```
+    pub fn pop_n(&self, target: &mut [T]) -> usize {
+        let current_head = self.head.load(Ordering::Relaxed);
+
+        self.shadow_tail.set(self.tail.load(Ordering::Acquire));
+        if current_head == self.shadow_tail.get() {
+            return 0;
+        }
+
+        let available = self.shadow_tail.get().wrapping_sub(current_head);
+        let diff = if available > target.len() {
+            target.len()
+        } else {
+            available
+        };
+
+        if mem::needs_drop::<T>() {
+            for slot in target[..diff].iter_mut() {
+                unsafe { ptr::drop_in_place(slot) };
+            }
+        }
+
+        // The read may wrap the ring, in which case it is a tail run and a head run.
+        let start = current_head & (self.allocated_size - 1);
+        let contiguous = self.allocated_size - start;
+        let first = if contiguous > diff { diff } else { contiguous };
+        let wrapped = diff - first;
+
+        unsafe {
+            ptr::copy_nonoverlapping(self.buffer.add(start), target.as_mut_ptr(), first);
+
+            if wrapped > 0 {
+                ptr::copy_nonoverlapping(self.buffer, target.as_mut_ptr().add(first), wrapped);
+            }
+        }
+
+        self.head
+            .store(current_head.wrapping_add(diff), Ordering::Release);
+
+        diff
+    }
+
     /// Pop a value off the buffer.
     ///
     /// This method will block until the buffer is non-empty.  The waiting strategy is a simple
@@ -243,9 +296,7 @@ impl<T> Buffer<T> {
     /// buffer wrapping is handled inside the method.
     #[inline]
     unsafe fn load(&self, pos: usize) -> &T {
-        &*self
-            .buffer
-            .offset((pos & (self.allocated_size - 1)) as isize)
+        &*self.buffer.add(pos & (self.allocated_size - 1))
     }
 
     /// Store a value in the buffer
@@ -256,9 +307,7 @@ impl<T> Buffer<T> {
     /// - Initialized a valid block of memory
     #[inline]
     unsafe fn store(&self, pos: usize, v: T) {
-        let end = self
-            .buffer
-            .offset((pos & (self.allocated_size - 1)) as isize);
+        let end = self.buffer.add(pos & (self.allocated_size - 1));
         ptr::write(&mut *end, v);
     }
 }
@@ -271,7 +320,7 @@ impl<T> Drop for Buffer<T> {
 
         // TODO this could be optimized to avoid the atomic operations / book-keeping...but
         // since this is the destructor, there shouldn't be any contention... so meh?
-        while let Some(_) = self.try_pop() {}
+        while self.try_pop().is_some() {}
 
         if mem::size_of::<T>() > 0 {
             unsafe {
@@ -378,7 +427,7 @@ unsafe fn allocate_buffer<T>(capacity: usize) -> *mut T {
     let ptr = if size > 0 {
         raw_alloc(layout) as *mut T
     } else {
-        mem::align_of::<T>() as *mut T
+        core::ptr::NonNull::<T>::dangling().as_ptr()
     };
 
     if ptr.is_null() {
@@ -444,7 +493,7 @@ impl<T> Producer<T> {
     /// assert!(producer.capacity() == 100);
     /// ```
     pub fn capacity(&self) -> usize {
-        (*self.buffer).capacity
+        self.buffer.capacity
     }
 
     /// Returns the current size of the queue
@@ -462,7 +511,7 @@ impl<T> Producer<T> {
     /// assert!(producer.size() == 1);
     /// ```
     pub fn size(&self) -> usize {
-        (*self.buffer).tail.load(Ordering::Acquire) - (*self.buffer).head.load(Ordering::Acquire)
+        self.buffer.tail.load(Ordering::Acquire) - self.buffer.head.load(Ordering::Acquire)
     }
 
     /// Returns the available space in the queue
@@ -551,6 +600,22 @@ impl<T> Consumer<T> {
     pub fn skip_n(&self, n: usize) -> usize {
         (*self.buffer).skip_n(n)
     }
+
+    /// Pop up to `target.len()` values off the queue in one go, returning how many moved.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bounded_spsc_queue::*;
+    ///
+    /// let (_, consumer) = make(100);
+    ///
+    /// let mut buffer = [0; 512];
+    /// let popped = consumer.pop_n(&mut buffer); // try to pop at most 512 elements
+    /// ```
+    pub fn pop_n(&self, target: &mut [T]) -> usize {
+        self.buffer.pop_n(target)
+    }
     /// Returns the total capacity of this queue
     ///
     /// This value represents the total capacity of the queue when it is full.  It does not
@@ -566,7 +631,7 @@ impl<T> Consumer<T> {
     /// assert!(producer.capacity() == 100);
     /// ```
     pub fn capacity(&self) -> usize {
-        (*self.buffer).capacity
+        self.buffer.capacity
     }
 
     /// Returns the current size of the queue
@@ -586,7 +651,7 @@ impl<T> Consumer<T> {
     /// assert!(producer.size() == 9);
     /// ```
     pub fn size(&self) -> usize {
-        (*self.buffer).tail.load(Ordering::Acquire) - (*self.buffer).head.load(Ordering::Acquire)
+        self.buffer.tail.load(Ordering::Acquire) - self.buffer.head.load(Ordering::Acquire)
     }
 }
 
@@ -599,6 +664,7 @@ mod tests {
 
     use super::*;
     use std::thread;
+    use std::vec::Vec;
 
     #[test]
     fn test_buffer_size() {
@@ -686,7 +752,7 @@ mod tests {
             Some(v) => {
                 assert!(v == 10);
             }
-            None => assert!(false, "Queue should not have accepted another write!"),
+            None => panic!("Queue should not have accepted another write!"),
         }
     }
 
@@ -694,24 +760,145 @@ mod tests {
     fn test_try_poll() {
         let (p, c) = super::make(10);
 
-        match c.try_pop() {
-            Some(_) => assert!(false, "Queue was empty but a value was read!"),
-            None => {}
+        if c.try_pop().is_some() {
+            panic!("Queue was empty but a value was read!")
         }
 
         p.push(123);
 
         match c.try_pop() {
             Some(v) => assert!(v == 123),
-            None => assert!(false, "Queue was not empty but poll() returned nothing!"),
+            None => panic!("Queue was not empty but poll() returned nothing!"),
         }
 
-        match c.try_pop() {
-            Some(_) => assert!(false, "Queue was empty but a value was read!"),
-            None => {}
+        if c.try_pop().is_some() {
+            panic!("Queue was empty but a value was read!")
         }
     }
 
+    #[test]
+    fn test_pop_n() {
+        {
+            let (p, c) = super::make(500);
+            for _ in 0..500 {
+                for i in 0..500 {
+                    p.push(i)
+                }
+
+                let mut buf = vec![0; 500];
+
+                assert_eq!(c.pop_n(&mut buf[..]), 500);
+                assert_eq!(buf, (0..500).collect::<Vec<_>>());
+            }
+        }
+
+        {
+            let (p, c) = super::make(8);
+            for i in 0..8 {
+                p.push(i)
+            }
+
+            let mut buf = vec![0; 8];
+            assert_eq!(c.pop_n(&mut buf[..]), 8);
+            assert_eq!(buf, (0..8).collect::<Vec<_>>());
+        }
+
+        {
+            let (p, c) = super::make(500);
+            for i in 0..500 {
+                p.push(i)
+            }
+
+            {
+                let mut buf = [0, 0, 0];
+
+                assert_eq!(c.pop_n(&mut buf), 3);
+                assert_eq!(c.size(), 497);
+                assert_eq!(buf, [0, 1, 2]);
+
+                assert_eq!(c.pop_n(&mut buf), 3);
+                assert_eq!(c.size(), 494);
+                assert_eq!(buf, [3, 4, 5]);
+
+                c.pop();
+                c.pop();
+
+                assert_eq!(c.pop_n(&mut buf), 3);
+                assert_eq!(c.size(), 489);
+                assert_eq!(buf, [8, 9, 10]);
+            }
+
+            {
+                let mut buf = [0; 1000];
+                let expected = 489;
+                assert_eq!(c.pop_n(&mut buf), expected);
+                assert_eq!(c.size(), 0);
+                assert_eq!(&buf[..expected], &(11..500).collect::<Vec<_>>()[..]);
+            }
+        }
+    }
+
+    /// A bulk read writes over slots the caller still owns. Assigning to one would drop the
+    /// old value, so `pop_n` has to, or every `T` with a destructor leaks whatever it
+    /// overwrites. Counted rather than asserted on a leak checker so it fails under plain
+    /// `cargo test`.
+    #[test]
+    fn test_pop_n_drops_what_it_overwrites() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        struct Counted(#[allow(dead_code)] usize);
+
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, O::Relaxed);
+            }
+        }
+
+        let (p, c) = super::make(8);
+        for i in 0..4 {
+            p.push(Counted(i));
+        }
+
+        // Four values the caller owns, about to be overwritten by four from the ring.
+        let mut target: Vec<Counted> = (100..104).map(Counted).collect();
+
+        DROPS.store(0, O::Relaxed);
+        assert_eq!(c.pop_n(&mut target[..]), 4);
+        assert_eq!(
+            DROPS.load(O::Relaxed),
+            4,
+            "pop_n overwrote 4 owned values and dropped {} of them",
+            DROPS.load(O::Relaxed)
+        );
+
+        // And the values that came out of the ring are dropped once, by the caller.
+        DROPS.store(0, O::Relaxed);
+        drop(target);
+        assert_eq!(DROPS.load(O::Relaxed), 4);
+    }
+
+    /// A bulk read that wraps the ring is a tail run plus a head run, and the two-copy path
+    /// is only exercised when the head is not at zero.
+    #[test]
+    fn test_pop_n_wraps() {
+        let (p, c) = super::make(8);
+        for i in 0..8 {
+            p.push(i)
+        }
+        let mut warm = [0; 6];
+        assert_eq!(c.pop_n(&mut warm), 6);
+
+        // Head is now 6, so pushing 6 more puts 2 before the wrap and 4 after it.
+        for i in 8..14 {
+            p.push(i)
+        }
+        let mut buf = [0; 8];
+        assert_eq!(c.pop_n(&mut buf), 8);
+        assert_eq!(buf, [6, 7, 8, 9, 10, 11, 12, 13]);
+        assert_eq!(c.size(), 0);
+    }
     #[test]
     fn test_threaded() {
         let (p, c) = super::make(500);
