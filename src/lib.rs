@@ -1,19 +1,27 @@
-extern crate core;
+#![no_std]
+#![cfg_attr(test, allow(unused_imports))]
 
 use core::alloc::Layout;
 use core::{mem, ptr};
-use std::alloc;
-use std::cell::Cell;
-use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::usize;
+extern crate alloc;
 
+use alloc::alloc::{alloc as raw_alloc, dealloc, handle_alloc_error};
+use alloc::sync::Arc;
+use core::cell::Cell;
+use core::fmt;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+// 128 on Apple silicon. At 64 the producer and consumer groups are 64 bytes each and
+// `Buffer` has no alignment attribute, so whether they land on separate lines depends on
+// where the allocator put the struct.
+#[cfg(target_arch = "aarch64")]
+const CACHELINE_LEN: usize = 128;
+#[cfg(not(target_arch = "aarch64"))]
 const CACHELINE_LEN: usize = 64;
 
 macro_rules! cacheline_pad {
     ($N:expr) => {
-        CACHELINE_LEN / std::mem::size_of::<usize>() - $N
+        CACHELINE_LEN / core::mem::size_of::<usize>() - $N
     };
 }
 
@@ -22,7 +30,8 @@ macro_rules! cacheline_pad {
 /// Buffer holds a pointer to allocated memory which represents the bounded
 /// ring buffer, as well as a head and tail atomicUsize which the producer and consumer
 /// use to track location in the ring.
-#[repr(C)]
+#[cfg_attr(target_arch = "aarch64", repr(C, align(128)))]
+#[cfg_attr(not(target_arch = "aarch64"), repr(C, align(64)))]
 pub struct Buffer<T> {
     /// A pointer to the allocated ring buffer
     buffer: *mut T,
@@ -234,7 +243,8 @@ impl<T> Buffer<T> {
     /// buffer wrapping is handled inside the method.
     #[inline]
     unsafe fn load(&self, pos: usize) -> &T {
-        &*self.buffer
+        &*self
+            .buffer
             .offset((pos & (self.allocated_size - 1)) as isize)
     }
 
@@ -246,7 +256,8 @@ impl<T> Buffer<T> {
     /// - Initialized a valid block of memory
     #[inline]
     unsafe fn store(&self, pos: usize, v: T) {
-        let end = self.buffer
+        let end = self
+            .buffer
             .offset((pos & (self.allocated_size - 1)) as isize);
         ptr::write(&mut *end, v);
     }
@@ -267,8 +278,9 @@ impl<T> Drop for Buffer<T> {
                 let layout = Layout::from_size_align(
                     self.allocated_size * mem::size_of::<T>(),
                     mem::align_of::<T>(),
-                ).unwrap();
-                alloc::dealloc(self.buffer as *mut u8, layout);
+                )
+                .unwrap();
+                dealloc(self.buffer as *mut u8, layout);
             }
         }
     }
@@ -364,13 +376,13 @@ unsafe fn allocate_buffer<T>(capacity: usize) -> *mut T {
     let layout = Layout::from_size_align(size, mem::align_of::<T>()).unwrap();
 
     let ptr = if size > 0 {
-        alloc::alloc(layout) as *mut T
+        raw_alloc(layout) as *mut T
     } else {
         mem::align_of::<T>() as *mut T
     };
 
     if ptr.is_null() {
-        alloc::handle_alloc_error(layout)
+        handle_alloc_error(layout)
     } else {
         ptr
     }
@@ -579,6 +591,10 @@ impl<T> Consumer<T> {
 }
 
 #[cfg(test)]
+#[macro_use]
+extern crate std;
+
+#[cfg(test)]
 mod tests {
 
     use super::*;
@@ -763,5 +779,4 @@ mod tests {
             (start.to(end)).num_nanoseconds().unwrap()
         );
     }
-
 }
