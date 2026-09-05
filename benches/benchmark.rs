@@ -60,7 +60,7 @@ fn bench_chan_threaded(b: &mut Bencher) {
 
     let flag_clone = arc_flag.clone();
     thread::spawn(move || {
-        while flag_clone.load(Ordering::Acquire) == false {
+        while !flag_clone.load(Ordering::Acquire) {
             // Try to do as much work as possible without checking the atomic
             for _ in 0..400 {
                 rx.recv().unwrap();
@@ -86,7 +86,7 @@ fn bench_chan_threaded2(b: &mut Bencher) {
 
     let flag_clone = arc_flag.clone();
     thread::spawn(move || {
-        while flag_clone.load(Ordering::Acquire) == false {
+        while !flag_clone.load(Ordering::Acquire) {
             // Try to do as much work as possible without checking the atomic
             for _ in 0..400 {
                 let _ = tx.send(1);
@@ -122,7 +122,7 @@ fn bench_spsc_threaded(b: &mut Bencher) {
 
     let flag_clone = arc_flag.clone();
     thread::spawn(move || {
-        while flag_clone.load(Ordering::Acquire) == false {
+        while !flag_clone.load(Ordering::Acquire) {
             // Try to do as much work as possible without checking the atomic
             for _ in 0..400 {
                 c.pop();
@@ -149,7 +149,7 @@ fn bench_spsc_threaded2(b: &mut Bencher) {
 
     let flag_clone = arc_flag.clone();
     thread::spawn(move || {
-        while flag_clone.load(Ordering::Acquire) == false {
+        while !flag_clone.load(Ordering::Acquire) {
             // Try to do as much work as possible without checking the atomic
             for _ in 0..400 {
                 p.push(1);
