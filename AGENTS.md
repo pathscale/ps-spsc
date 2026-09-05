@@ -1,11 +1,11 @@
-# Working agreement — bounded-spsc-queue
+# Working agreement — ps-spsc
 
 The operating contract for **any** coding agent working in this repository. This file is
 the single source of truth for the rules: Codex, Cursor and Gemini CLI read `AGENTS.md`
 natively, and Claude Code loads it through the `@AGENTS.md` import in
 [`CLAUDE.md`](CLAUDE.md). **Never fork these rules into a per-vendor file.**
 
-**Rust crate** (`bounded-spsc-queue`).
+**Rust crate** (`ps-spsc`), a fork of `polyfractal/bounded-spsc-queue`.
 
 ## Invariants (don't break these)
 

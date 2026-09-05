@@ -562,7 +562,7 @@ impl<T> Consumer<T> {
     /// # Examples
     ///
     /// ```
-    /// use bounded_spsc_queue::*;
+    /// use spsc::*;
     ///
     /// let (_, consumer) = make(100);
     ///
@@ -590,7 +590,7 @@ impl<T> Consumer<T> {
     /// # Examples
     ///
     /// ```
-    /// use bounded_spsc_queue::*;
+    /// use spsc::*;
     ///
     /// let (_, consumer) = make(100);
     ///
@@ -606,7 +606,7 @@ impl<T> Consumer<T> {
     /// # Examples
     ///
     /// ```
-    /// use bounded_spsc_queue::*;
+    /// use spsc::*;
     ///
     /// let (_, consumer) = make(100);
     ///
