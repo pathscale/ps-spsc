@@ -10,6 +10,11 @@ on:
   workflow_dispatch:
 
 jobs:
+
+permissions:
+  # The tag push at the end needs it; without it the job publishes and then
+  # fails 403 on `git push origin v<x>`, which is how v0.5.0 shipped untagged.
+  contents: write
   publish:
     runs-on: ubicloud-standard-2
     steps:
