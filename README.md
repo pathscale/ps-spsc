@@ -1,7 +1,7 @@
 
 ## Bounded SPSC Queue
 
-[![Nightly Build Status](https://travis-ci.org/polyfractal/bounded-spsc-queue.svg?branch=master)](https://travis-ci.org/polyfractal/bounded-spsc-queue)
+A PathScale fork of [polyfractal/bounded-spsc-queue](https://github.com/polyfractal/bounded-spsc-queue), published as `ps-spsc`. It builds without the standard library, pads to the 128-byte line on Apple silicon, and adds a bulk `pop_n`.
 
 This crate provides a very simple bounded, Single-producer Single-consumer (SPSC)
 queue for Rust.  It provides a data structure for two threads to communicate
@@ -9,22 +9,22 @@ in one direction with minimal overhead and bounded semantics.
 
 Compared to a `sync_channel`, this queue provides a small but consistent
 speedup.  `sync_channel` utilizes an unbounded linked-list data structure under the covers,
-while `bounded_spsc_queue` is a simple ring buffer with single, solid block of allocated
+while `spsc` is a simple ring buffer with single, solid block of allocated
 memory.  The solid block of memory allows better cache pre-fetching due to less pointer
 indirection, and generally simpler operations to achieve a bounded SPSC queue.
 
 ## Documentation
 
-[Documentation can be found here](http://polyfractal.github.io/bounded-spsc-queue/bounded_spsc_queue/index.html)
+[Documentation can be found here](https://docs.rs/ps-spsc)
 
 ## Example
 
 ```rust
 use std::thread;
-use bounded_spsc_queue::{Producer, Consumer};
+use spsc::{Producer, Consumer};
 
 // Initialize a queue with capacity of 500 values
-let (p, c) = bounded_spsc_queue::make(500);
+let (p, c) = spsc::make(500);
 
 // Spawn a new thread and move the Producer into it
 thread::spawn(move|| {
