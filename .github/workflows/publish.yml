@@ -13,6 +13,7 @@ on:
 
 jobs:
   publish:
+    if: github.ref == 'refs/heads/master'
     runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v4
@@ -38,9 +39,14 @@ jobs:
             3) path="3/${name:0:1}/$name" ;;
             *) path="${name:0:2}/${name:2:2}/$name" ;;
           esac
-          # A crate with no releases yet 404s, which is a reason to publish and
-          # not an error, so the failure is confined to the `if` condition.
-          if curl -sf "https://index.crates.io/$path" | grep -q "\"vers\":\"$new\""; then
+          response="$RUNNER_TEMP/ps-spsc-registry.jsonl"
+          status=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "https://index.crates.io/$path")
+          case "$status" in
+            200) ;;
+            404) : > "$response" ;;
+            *) echo "Registry lookup failed: HTTP $status" >&2; exit 1 ;;
+          esac
+          if grep -Fq "\"vers\":\"$new\"" "$response"; then
             echo "$name $new is already on crates.io, nothing to publish"
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
