@@ -1,65 +1,34 @@
 name: Publish
 
-# House scheme: a version bump on the default branch is the release. No tags,
-# no manual step. Publishing is irreversible, so the trigger has to be
-# something you cannot do by accident, and editing the version field is that.
+# A version bump on master is the release trigger. Cargo packages, verifies and
+# uploads the crate; crates.io decides whether that version can be published.
 on:
   push:
     branches: [master]
     paths: ['Cargo.toml']
-  # A release merged before this gate was fixed has no Cargo.toml change left
-  # to make, so the push rule alone can never start it.
   workflow_dispatch:
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   publish:
     if: github.ref == 'refs/heads/master'
     runs-on: ubicloud-standard-2
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
-      # The registry is the only authority on what is already released.
-      #
-      # This compared HEAD against HEAD^, which is only correct when the
-      # version bump is the last commit of the push. A rebased or squashed
-      # merge lands many commits at once and the bump is rarely the last of
-      # them, so the gate reads "unchanged", the job goes green, and nothing
-      # is published. That is how ps-st3 0.6.1 and nagoya 0.1.1 came to be
-      # merged, reported green, and absent from crates.io. This repository
-      # carried the same gate and has not released since, so it had not
-      # fired here yet.
-      - id: version
-        run: |
-          name=$(grep -m1 '^name = ' Cargo.toml | cut -d'"' -f2)
-          new=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          case ${#name} in
-            1) path="1/$name" ;;
-            2) path="2/$name" ;;
-            3) path="3/${name:0:1}/$name" ;;
-            *) path="${name:0:2}/${name:2:2}/$name" ;;
-          esac
-          response="$RUNNER_TEMP/ps-spsc-registry.jsonl"
-          status=$(curl --silent --show-error --output "$response" --write-out '%{http_code}' "https://index.crates.io/$path")
-          case "$status" in
-            200) ;;
-            404) : > "$response" ;;
-            *) echo "Registry lookup failed: HTTP $status" >&2; exit 1 ;;
-          esac
-          if grep -Fq "\"vers\":\"$new\"" "$response"; then
-            echo "$name $new is already on crates.io, nothing to publish"
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "$name $new is not on crates.io, publishing"
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      # The gate runs on this commit too, but a release must not depend on job
-      # ordering, so it is re-run here rather than assumed.
-      - if: steps.version.outputs.changed == 'true'
+      - name: Test
         run: cargo test --release
 
-      - if: steps.version.outputs.changed == 'true'
-        run: cargo publish --token "$CARGO_REGISTRY_TOKEN"
+      - name: Publish
+        run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
