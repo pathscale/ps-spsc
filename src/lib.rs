@@ -9,7 +9,15 @@ use alloc::alloc::{alloc as raw_alloc, dealloc, handle_alloc_error};
 use alloc::sync::Arc;
 use core::cell::Cell;
 use core::fmt;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{fence, AtomicU32, AtomicUsize, Ordering};
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+extern crate libc;
+
+mod park;
+
+/// Spin rounds the blocking `*_wait` calls make before they park.
+pub const DEFAULT_SPIN: u32 = 1024;
 
 // 128 on Apple silicon. At 64 the producer and consumer groups are 64 bytes each and
 // `Buffer` has no alignment attribute, so whether they land on separate lines depends on
@@ -50,14 +58,20 @@ pub struct Buffer<T> {
     /// Index position of the current head
     head: AtomicUsize,
     shadow_tail: Cell<usize>,
-    _padding2: [usize; cacheline_pad!(2)],
+    /// Non-zero while the producer is parked on a full queue. Read by the consumer after
+    /// it frees slots in the `*_wait` calls; written by the producer only when it parks.
+    producer_parked: AtomicU32,
+    _padding2: [usize; cacheline_pad!(3)],
 
     /// Producer cacheline:
 
     /// Index position of current tail
     tail: AtomicUsize,
     shadow_head: Cell<usize>,
-    _padding3: [usize; cacheline_pad!(2)],
+    /// Non-zero while the consumer is parked on an empty queue. Read by the producer after
+    /// it publishes in the `*_wait` calls; written by the consumer only when it parks.
+    consumer_parked: AtomicU32,
+    _padding3: [usize; cacheline_pad!(3)],
 }
 
 impl<T> fmt::Debug for Buffer<T> {
@@ -284,6 +298,213 @@ impl<T> Buffer<T> {
         }
     }
 
+    /// Attempt to push the values of `src` in one go, returning how many were pushed.
+    ///
+    /// Copies as many values as fit, possibly none, with one tail publish.
+    pub fn try_push_n(&self, src: &[T]) -> usize
+    where
+        T: Copy,
+    {
+        self.push_n_with(src, Ordering::Release)
+    }
+
+    #[inline]
+    fn push_n_with(&self, src: &[T], publish: Ordering) -> usize
+    where
+        T: Copy,
+    {
+        let current_tail = self.tail.load(Ordering::Relaxed);
+        let mut free = (self.shadow_head.get() + self.capacity).wrapping_sub(current_tail);
+        if free < src.len() {
+            self.shadow_head.set(self.head.load(Ordering::Acquire));
+            free = (self.shadow_head.get() + self.capacity).wrapping_sub(current_tail);
+        }
+        let n = if free < src.len() { free } else { src.len() };
+        if n == 0 {
+            return 0;
+        }
+        let start = current_tail & (self.allocated_size - 1);
+        let contiguous = self.allocated_size - start;
+        let first = if contiguous > n { n } else { contiguous };
+        unsafe {
+            ptr::copy_nonoverlapping(src.as_ptr(), self.buffer.add(start), first);
+            if n > first {
+                ptr::copy_nonoverlapping(src.as_ptr().add(first), self.buffer, n - first);
+            }
+        }
+        self.tail.store(current_tail.wrapping_add(n), publish);
+        n
+    }
+
+    /// `try_push` with a SeqCst tail publish, for the wait path. Paired with the SeqCst flag
+    /// read in `wake_consumer` and the SeqCst flag store and tail read in `park_consumer`,
+    /// the single total order of SeqCst operations rules out a lost wakeup without a fence.
+    #[inline]
+    fn try_push_sc(&self, v: T) -> Option<T> {
+        let current_tail = self.tail.load(Ordering::Relaxed);
+        if self.shadow_head.get() + self.capacity <= current_tail {
+            self.shadow_head.set(self.head.load(Ordering::Relaxed));
+            if self.shadow_head.get() + self.capacity <= current_tail {
+                return Some(v);
+            }
+        }
+        unsafe {
+            self.store(current_tail, v);
+        }
+        self.tail
+            .store(current_tail.wrapping_add(1), Ordering::SeqCst);
+        None
+    }
+
+    /// Wake the consumer if it is parked. Called after a SeqCst tail publish; the consumer
+    /// raises its flag and re-reads the tail with SeqCst too, so in the single SeqCst order
+    /// one side always sees the other and no wakeup is lost. This StoreLoad is the cost of
+    /// parking on the push side, which is why `push_n_wait` pays it once per batch.
+    #[inline]
+    fn wake_consumer(&self) {
+        if self.consumer_parked.load(Ordering::SeqCst) != 0
+            && self.consumer_parked.swap(0, Ordering::Relaxed) != 0
+        {
+            park::wake(&self.consumer_parked);
+        }
+    }
+
+    /// Hot-path producer wake after a pop: a relaxed flag read with no fence. It can miss
+    /// a producer that is parking right now; `park_consumer` closes that gap with a
+    /// fenced check before the consumer itself sleeps. A parked producer means a full
+    /// queue, so the consumer keeps popping until it either sees the flag or runs dry.
+    #[inline]
+    fn wake_producer_lazy(&self) {
+        if self.producer_parked.load(Ordering::Relaxed) != 0
+            && self.producer_parked.swap(0, Ordering::Relaxed) != 0
+        {
+            park::wake(&self.producer_parked);
+        }
+    }
+
+    /// Fenced form of `wake_producer_lazy`, used before the consumer parks.
+    #[inline]
+    fn wake_producer(&self) {
+        fence(Ordering::SeqCst);
+        if self.producer_parked.load(Ordering::Relaxed) != 0
+            && self.producer_parked.swap(0, Ordering::Relaxed) != 0
+        {
+            park::wake(&self.producer_parked);
+        }
+    }
+
+    #[cold]
+    fn park_consumer(&self) {
+        self.wake_producer();
+        self.consumer_parked.store(1, Ordering::SeqCst);
+        if self.tail.load(Ordering::SeqCst) == self.head.load(Ordering::Relaxed) {
+            park::wait(&self.consumer_parked, 1);
+        }
+        self.consumer_parked.store(0, Ordering::Relaxed);
+    }
+
+    #[cold]
+    fn park_producer(&self) {
+        self.producer_parked.store(1, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        let head = self.head.load(Ordering::Relaxed);
+        if head + self.capacity <= self.tail.load(Ordering::Relaxed) {
+            park::wait(&self.producer_parked, 1);
+        }
+        self.producer_parked.store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn pop_wait_spin(&self, spins: u32) -> T {
+        loop {
+            let mut round = 0;
+            loop {
+                if let Some(v) = self.try_pop() {
+                    self.wake_producer_lazy();
+                    return v;
+                }
+                if round >= spins {
+                    break;
+                }
+                round += 1;
+                core::hint::spin_loop();
+            }
+            self.park_consumer();
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn push_wait_spin(&self, v: T, spins: u32) {
+        let mut v = v;
+        loop {
+            let mut round = 0;
+            loop {
+                match self.try_push_sc(v) {
+                    None => {
+                        self.wake_consumer();
+                        return;
+                    }
+                    Some(back) => v = back,
+                }
+                if round >= spins {
+                    break;
+                }
+                round += 1;
+                core::hint::spin_loop();
+            }
+            self.park_producer();
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn pop_n_wait_spin(&self, target: &mut [T], spins: u32) -> usize {
+        if target.is_empty() {
+            return 0;
+        }
+        loop {
+            let mut round = 0;
+            loop {
+                let n = self.pop_n(target);
+                if n > 0 {
+                    self.wake_producer_lazy();
+                    return n;
+                }
+                if round >= spins {
+                    break;
+                }
+                round += 1;
+                core::hint::spin_loop();
+            }
+            self.park_consumer();
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn push_n_wait_spin(&self, src: &[T], spins: u32)
+    where
+        T: Copy,
+    {
+        let mut done = 0;
+        while done < src.len() {
+            let mut round = 0;
+            loop {
+                let n = self.push_n_with(&src[done..], Ordering::SeqCst);
+                if n > 0 {
+                    done += n;
+                    self.wake_consumer();
+                    break;
+                }
+                if round >= spins {
+                    self.park_producer();
+                    round = 0;
+                    continue;
+                }
+                round += 1;
+                core::hint::spin_loop();
+            }
+        }
+    }
+
     /// Load a value out of the buffer
     ///
     /// # Safety
@@ -398,11 +619,13 @@ pub fn make<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
 
         head: AtomicUsize::new(0),
         shadow_tail: Cell::new(0),
-        _padding2: [0; cacheline_pad!(2)],
+        producer_parked: AtomicU32::new(0),
+        _padding2: [0; cacheline_pad!(3)],
 
         tail: AtomicUsize::new(0),
         shadow_head: Cell::new(0),
-        _padding3: [0; cacheline_pad!(2)],
+        consumer_parked: AtomicU32::new(0),
+        _padding3: [0; cacheline_pad!(3)],
     });
 
     (
@@ -476,6 +699,44 @@ impl<T> Producer<T> {
     /// ```
     pub fn try_push(&self, v: T) -> Option<T> {
         (*self.buffer).try_push(v)
+    }
+
+    /// Push a value, parking the thread (no CPU) while the queue is full, and wake a
+    /// consumer parked in [`Consumer::pop_wait`]. Spins briefly before parking.
+    ///
+    /// Only the `*_wait` calls wake a parked peer: pair `push_wait` with `pop_wait` or
+    /// `pop_n_wait`, not with the spinning `pop`/`try_pop` against a parked producer.
+    pub fn push_wait(&self, v: T) {
+        self.buffer.push_wait_spin(v, DEFAULT_SPIN)
+    }
+
+    /// Push every value of `src`, in as few tail publishes as fit, parking while full.
+    pub fn push_n_wait(&self, src: &[T])
+    where
+        T: Copy,
+    {
+        self.buffer.push_n_wait_spin(src, DEFAULT_SPIN)
+    }
+
+    /// Push as many values of `src` as fit without blocking, returning the count.
+    pub fn try_push_n(&self, src: &[T]) -> usize
+    where
+        T: Copy,
+    {
+        self.buffer.try_push_n(src)
+    }
+
+    #[doc(hidden)]
+    pub fn push_wait_spin(&self, v: T, spins: u32) {
+        self.buffer.push_wait_spin(v, spins)
+    }
+
+    #[doc(hidden)]
+    pub fn push_n_wait_spin(&self, src: &[T], spins: u32)
+    where
+        T: Copy,
+    {
+        self.buffer.push_n_wait_spin(src, spins)
     }
 
     /// Returns the total capacity of this queue
@@ -616,6 +877,29 @@ impl<T> Consumer<T> {
     pub fn pop_n(&self, target: &mut [T]) -> usize {
         self.buffer.pop_n(target)
     }
+
+    /// Pop a value, parking the thread (no CPU) while the queue is empty, and wake a
+    /// producer parked in [`Producer::push_wait`]. Spins briefly before parking.
+    pub fn pop_wait(&self) -> T {
+        self.buffer.pop_wait_spin(DEFAULT_SPIN)
+    }
+
+    /// Pop at least one and up to `target.len()` values, parking while empty.
+    /// Returns 0 only for an empty `target`.
+    pub fn pop_n_wait(&self, target: &mut [T]) -> usize {
+        self.buffer.pop_n_wait_spin(target, DEFAULT_SPIN)
+    }
+
+    #[doc(hidden)]
+    pub fn pop_wait_spin(&self, spins: u32) -> T {
+        self.buffer.pop_wait_spin(spins)
+    }
+
+    #[doc(hidden)]
+    pub fn pop_n_wait_spin(&self, target: &mut [T], spins: u32) -> usize {
+        self.buffer.pop_n_wait_spin(target, spins)
+    }
+
     /// Returns the total capacity of this queue
     ///
     /// This value represents the total capacity of the queue when it is full.  It does not
@@ -980,5 +1264,37 @@ mod tests {
             iterations,
             (start.to(end)).num_nanoseconds().unwrap()
         );
+    }
+    #[test]
+    fn test_wait_round_trip() {
+        let (p, c) = super::make::<u32>(4);
+        p.push_wait(1);
+        p.push_n_wait(&[2, 3, 4]);
+        assert_eq!(p.try_push_n(&[5]), 0);
+        assert_eq!(c.pop_wait(), 1);
+        let mut buf = [0u32; 8];
+        assert_eq!(c.pop_n_wait(&mut buf), 3);
+        assert_eq!(&buf[..3], &[2, 3, 4]);
+        assert_eq!(c.pop_n_wait(&mut []), 0);
+    }
+
+    // Parking calls the OS wait primitive, which Miri does not model.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_wait_threaded() {
+        let (p, c) = super::make::<u64>(2);
+        let h = thread::spawn(move || {
+            for i in 0..100_000u64 {
+                if i % 3 == 0 {
+                    p.push_n_wait(&[i]);
+                } else {
+                    p.push_wait(i);
+                }
+            }
+        });
+        for i in 0..100_000u64 {
+            assert_eq!(c.pop_wait(), i);
+        }
+        h.join().unwrap();
     }
 }
