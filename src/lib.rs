@@ -14,6 +14,7 @@ use core::sync::atomic::{fence, AtomicU32, AtomicUsize, Ordering};
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 extern crate libc;
 
+mod barrier;
 mod park;
 
 /// Spin rounds the blocking `*_wait` calls make before they park.
@@ -336,14 +337,13 @@ impl<T> Buffer<T> {
         n
     }
 
-    /// `try_push` with a SeqCst tail publish, for the wait path. Paired with the SeqCst flag
-    /// read in `wake_consumer` and the SeqCst flag store and tail read in `park_consumer`,
-    /// the single total order of SeqCst operations rules out a lost wakeup without a fence.
+    /// `try_push` for the wait path: a Release tail publish. The ordering against the
+    /// consumer parked flag comes from `barrier::light` in `wake_consumer`.
     #[inline]
     fn try_push_sc(&self, v: T) -> Option<T> {
         let current_tail = self.tail.load(Ordering::Relaxed);
         if self.shadow_head.get() + self.capacity <= current_tail {
-            self.shadow_head.set(self.head.load(Ordering::Relaxed));
+            self.shadow_head.set(self.head.load(Ordering::Acquire));
             if self.shadow_head.get() + self.capacity <= current_tail {
                 return Some(v);
             }
@@ -352,17 +352,19 @@ impl<T> Buffer<T> {
             self.store(current_tail, v);
         }
         self.tail
-            .store(current_tail.wrapping_add(1), Ordering::SeqCst);
+            .store(current_tail.wrapping_add(1), Ordering::Release);
         None
     }
 
-    /// Wake the consumer if it is parked. Called after a SeqCst tail publish; the consumer
-    /// raises its flag and re-reads the tail with SeqCst too, so in the single SeqCst order
-    /// one side always sees the other and no wakeup is lost. This StoreLoad is the cost of
-    /// parking on the push side, which is why `push_n_wait` pays it once per batch.
+    /// Wake the consumer if it is parked. Called right after a tail publish. This is a
+    /// Dekker handoff: we store the tail then load the flag, the consumer stores the flag
+    /// then loads the tail. `barrier::light` is only a compiler fence when the consumer
+    /// pays `barrier::heavy` (a barrier on every thread) between its two steps, so
+    /// either our tail store is visible to its re-check or our load sees its flag.
     #[inline]
     fn wake_consumer(&self) {
-        if self.consumer_parked.load(Ordering::SeqCst) != 0
+        barrier::light();
+        if self.consumer_parked.load(Ordering::Relaxed) != 0
             && self.consumer_parked.swap(0, Ordering::Relaxed) != 0
         {
             park::wake(&self.consumer_parked);
@@ -382,22 +384,15 @@ impl<T> Buffer<T> {
         }
     }
 
-    /// Fenced form of `wake_producer_lazy`, used before the consumer parks.
-    #[inline]
-    fn wake_producer(&self) {
-        fence(Ordering::SeqCst);
-        if self.producer_parked.load(Ordering::Relaxed) != 0
-            && self.producer_parked.swap(0, Ordering::Relaxed) != 0
-        {
-            park::wake(&self.producer_parked);
-        }
-    }
-
     #[cold]
     fn park_consumer(&self) {
-        self.wake_producer();
-        self.consumer_parked.store(1, Ordering::SeqCst);
-        if self.tail.load(Ordering::SeqCst) == self.head.load(Ordering::Relaxed) {
+        self.consumer_parked.store(1, Ordering::Relaxed);
+        // Full barrier on every thread: pairs with `barrier::light` in `wake_consumer`
+        // for our flag store and tail load, and with the SeqCst fence in `park_producer`
+        // for our earlier head stores and the producer flag load below.
+        barrier::heavy();
+        self.wake_producer_lazy();
+        if self.tail.load(Ordering::Acquire) == self.head.load(Ordering::Relaxed) {
             park::wait(&self.consumer_parked, 1);
         }
         self.consumer_parked.store(0, Ordering::Relaxed);
@@ -488,7 +483,7 @@ impl<T> Buffer<T> {
         while done < src.len() {
             let mut round = 0;
             loop {
-                let n = self.push_n_with(&src[done..], Ordering::SeqCst);
+                let n = self.push_n_with(&src[done..], Ordering::Release);
                 if n > 0 {
                     done += n;
                     self.wake_consumer();
@@ -609,6 +604,7 @@ impl<T> Drop for Buffer<T> {
 /// `capacity.next_power_of_two() * size_of::<T>() > available memory` ), this function will abort
 /// with an OOM panic.
 pub fn make<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
+    barrier::init();
     let ptr = unsafe { allocate_buffer(capacity) };
 
     let arc = Arc::new(Buffer {
