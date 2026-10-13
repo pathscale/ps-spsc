@@ -1,6 +1,6 @@
 [package]
 name = "ps-spsc"
-version = "0.5.0"
+version = "0.5.1"
 authors = ["Zachary Tong <zacharyjtong@gmail.com>"]
 license = "Apache-2.0"
 description = "A bounded SPSC queue"
