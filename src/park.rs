@@ -1,8 +1,10 @@
 //! Wait on a 32-bit word and wake its waiter: futex on Linux and Android,
-//! `os_sync_wait_on_address` on Apple (macOS 14.4+, looked up at runtime) with
-//! `__ulock_wait` as the fallback. No inline asm and no std.
+//! `os_sync_wait_on_address_with_timeout` on Apple (macOS 14.4+, looked up at
+//! runtime) with `__ulock_wait` as the fallback. No inline asm and no std.
 //!
 //! `wait` may return spuriously; callers re-check their condition in a loop.
+//! Apple waits request a 1 ms timeout so a failed process-wide barrier cannot
+//! leave a waiter asleep indefinitely after a missed wakeup.
 //! On any other target `wait` is a spin hint and `wake` does nothing, so the
 //! blocking calls degrade to the old spin-wait instead of failing to build.
 
@@ -46,13 +48,16 @@ mod imp {
 
     const UL_COMPARE_AND_WAIT: u32 = 1;
     const ULF_NO_ERRNO: u32 = 0x0100_0000;
+    const OS_CLOCK_MACH_ABSOLUTE_TIME: u32 = 32;
+    const WAIT_TIMEOUT_NS: u64 = 1_000_000;
+    const WAIT_TIMEOUT_US: u32 = 1_000;
 
     extern "C" {
         fn __ulock_wait(operation: u32, addr: *mut c_void, value: u64, timeout_us: u32) -> c_int;
         fn __ulock_wake(operation: u32, addr: *mut c_void, wake_value: u64) -> c_int;
     }
 
-    type OsWait = unsafe extern "C" fn(*mut c_void, u64, usize, u32) -> c_int;
+    type OsWait = unsafe extern "C" fn(*mut c_void, u64, usize, u32, u32, u64) -> c_int;
     type OsWake = unsafe extern "C" fn(*mut c_void, usize, u32) -> c_int;
 
     // 0 = not looked up yet, 1 = not available, anything else = the function.
@@ -64,7 +69,7 @@ mod imp {
         let wait = unsafe {
             libc::dlsym(
                 libc::RTLD_DEFAULT,
-                b"os_sync_wait_on_address\0".as_ptr() as *const libc::c_char,
+                b"os_sync_wait_on_address_with_timeout\0".as_ptr() as *const libc::c_char,
             )
         };
         let wake = unsafe {
@@ -107,14 +112,21 @@ mod imp {
         unsafe {
             match api() {
                 Some((wait, _)) => {
-                    wait(addr, u64::from(expected), 4, 0);
+                    wait(
+                        addr,
+                        u64::from(expected),
+                        4,
+                        0,
+                        OS_CLOCK_MACH_ABSOLUTE_TIME,
+                        WAIT_TIMEOUT_NS,
+                    );
                 }
                 None => {
                     __ulock_wait(
                         UL_COMPARE_AND_WAIT | ULF_NO_ERRNO,
                         addr,
                         u64::from(expected),
-                        0,
+                        WAIT_TIMEOUT_US,
                     );
                 }
             }
