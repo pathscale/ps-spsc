@@ -13,6 +13,29 @@ while `spsc` is a simple ring buffer with single, solid block of allocated
 memory.  The solid block of memory allows better cache pre-fetching due to less pointer
 indirection, and generally simpler operations to achieve a bounded SPSC queue.
 
+`make` rounds the requested capacity up to a power of two using checked
+arithmetic. It panics if rounding or allocation-size computation overflows, or
+if the allocation layout exceeds `isize::MAX` bytes. Capacity zero is supported
+and accepts no values. Zero-sized element types need no ring storage allocation.
+Allocation failure is handled by the allocator's allocation error handler.
+
+`pop_n` replaces existing target values. For types with destructors, each
+transfer is published before the old target value is dropped. If a destructor
+panics, completed transfers remain consumed and all target slots remain
+initialized. These transfers also wake a parked producer. Types without
+destructors retain the bulk-copy path.
+
+The blocking `*_wait` calls use paired light and heavy barriers when checking
+parked peers. Pair producer and consumer wait calls when either side may park;
+spinning `pop` and `try_pop` do not wake a parked producer.
+
+On Apple platforms, barrier scans skip terminated threads and dead thread
+destinations. Other scan failures use a local fence without changing the
+selected barrier mode. Apple waits request a 1 ms timeout and recheck the queue,
+so a missed wakeup does not cause an indefinite sleep. Idle Apple waiters
+therefore wake periodically. Linux and Android waits retain their existing
+behavior.
+
 ## Documentation
 
 [Documentation can be found here](https://docs.rs/ps-spsc)
