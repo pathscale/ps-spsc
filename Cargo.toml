@@ -29,5 +29,4 @@ harness = false
 
 [dev-dependencies]
 libc = "^0.2"
-criterion = "0.2.3"
-time = "0.1.39"
+criterion = "^0.5.1"

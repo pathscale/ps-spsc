@@ -1,8 +1,6 @@
 extern crate spsc;
 #[macro_use]
 extern crate criterion;
-extern crate time;
-
 use std::thread;
 
 use criterion::{Bencher, Criterion};
