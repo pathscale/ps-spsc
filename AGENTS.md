@@ -17,7 +17,7 @@ natively, and Claude Code loads it through the `@AGENTS.md` import in
   tested. If a task seems to need Python, the approach is wrong.
 
 - **Keep `cargo fmt` and `cargo clippy --all-targets` clean.** Lint failures are part of the build here, not advisory.
-- **Publishing to crates.io is irreversible.** A version number can never be reused, and yanking does not delete. Run `cargo publish --dry-run` first, publish from the merged default branch, and tag the release.
+- **Publishing to crates.io is irreversible.** A version number can never be reused, and yanking does not delete. The version in `Cargo.toml` is authoritative. Run `cargo publish --dry-run` first, then manually publish from `master`.
 - **Use caret requirements, including explicitly named prereleases.** For example, `"^2.0.0-alpha.1"` opts into the prerelease; `"^2.0"` does not. Do not introduce exact pins.
 - **Docs describe what is true now.** If you change behaviour, update the README and any affected doc in the same change.
 

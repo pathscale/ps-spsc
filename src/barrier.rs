@@ -9,6 +9,9 @@
 //! thread of the task, which interrupts each running thread to read its
 //! registers. That is what .NET uses for `FlushProcessWriteBuffers` on macOS;
 //! Apple does not document it as a barrier.
+//! Terminated Apple threads and dead destinations are skipped during a flush.
+//! Other Apple flush failures use a local SeqCst fence and bounded waits;
+//! the selected barrier mode is never changed after initialization.
 
 use core::sync::atomic::{compiler_fence, fence, AtomicU8, Ordering};
 
@@ -18,8 +21,8 @@ const FALLBACK: u8 = 2;
 
 static STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
 
-/// Decide once whether the heavy barrier works. Called by `make`, before any
-/// queue exists, so every `light` on a queue sees the final state.
+/// Choose the barrier mode before returning a queue from `make`.
+/// Concurrent probes may race, but the first published decision is permanent.
 pub(crate) fn init() {
     if STATE.load(Ordering::Relaxed) == UNKNOWN {
         let s = if imp::register() {
@@ -27,7 +30,7 @@ pub(crate) fn init() {
         } else {
             FALLBACK
         };
-        STATE.store(s, Ordering::Relaxed);
+        let _ = STATE.compare_exchange(UNKNOWN, s, Ordering::Relaxed, Ordering::Relaxed);
     }
 }
 
@@ -89,7 +92,9 @@ mod imp {
 mod imp {
     type Port = u32;
     const KERN_SUCCESS: i32 = 0;
+    const KERN_TERMINATED: i32 = 37;
     const KERN_INSUFFICIENT_BUFFER_SIZE: i32 = 52;
+    const MACH_SEND_INVALID_DEST: i32 = 0x1000_0003;
 
     extern "C" {
         static mach_task_self_: Port;
@@ -104,7 +109,8 @@ mod imp {
         fn vm_deallocate(task: Port, address: usize, size: usize) -> i32;
     }
 
-    /// Returns false if any live thread could not be interrupted.
+    /// Returns false if enumeration fails or a thread query reports an
+    /// unexpected error. Terminated threads and dead destinations are skipped.
     fn flush() -> bool {
         unsafe {
             let task = mach_task_self_;
@@ -121,8 +127,10 @@ mod imp {
                 let mut len = regs.len();
                 let r =
                     thread_get_register_pointer_values(th, &mut sp, &mut len, regs.as_mut_ptr());
-                if r != KERN_SUCCESS && r != KERN_INSUFFICIENT_BUFFER_SIZE {
-                    ok = false;
+                match r {
+                    KERN_SUCCESS | KERN_INSUFFICIENT_BUFFER_SIZE => {}
+                    KERN_TERMINATED | MACH_SEND_INVALID_DEST => {}
+                    _ => ok = false,
                 }
                 mach_port_deallocate(task, th);
             }
@@ -141,7 +149,9 @@ mod imp {
 
     pub(super) fn barrier() {
         if !flush() {
-            panic!("thread_get_register_pointer_values failed after a successful probe");
+            // Apple waits are bounded because the light side may have used
+            // only a compiler fence before this process-wide flush failed.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         }
     }
 }

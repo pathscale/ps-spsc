@@ -9,7 +9,7 @@ use alloc::alloc::{alloc as raw_alloc, dealloc, handle_alloc_error};
 use alloc::sync::Arc;
 use core::cell::Cell;
 use core::fmt;
-use core::sync::atomic::{fence, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 extern crate libc;
@@ -79,7 +79,6 @@ impl<T> fmt::Debug for Buffer<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Relaxed);
-        let shead = self.shadow_head.get();
 
         f.debug_struct("SPSC Buffer")
             .field("buffer_addr:", &self.buffer)
@@ -87,7 +86,6 @@ impl<T> fmt::Debug for Buffer<T> {
             .field("allocated_size:", &self.allocated_size)
             .field("consumer_head:", &head)
             .field("producer_tail:", &tail)
-            .field("shadow_head:", &shead)
             .finish()
     }
 }
@@ -169,9 +167,11 @@ impl<T> Buffer<T> {
 
     /// Pop up to `target.len()` values off the buffer in one go, returning how many moved.
     ///
-    /// The slots in `target` hold values the caller owns, and assigning to one would drop it,
-    /// so this drops them too before overwriting. For a `T` with no destructor that loop
-    /// compiles away and this is two `copy_nonoverlapping` calls.
+    /// The slots in `target` hold values the caller owns. For types with destructors,
+    /// each slot is replaced and the queue head is advanced before its old value is
+    /// dropped. If that destructor panics, completed transfers remain consumed and
+    /// every target slot remains initialized. Each such transfer wakes a parked producer.
+    /// Types without destructors use up to two `copy_nonoverlapping` calls.
     ///
     /// # Examples
     ///
@@ -195,27 +195,39 @@ impl<T> Buffer<T> {
         };
 
         if mem::needs_drop::<T>() {
+            let mut popped = 0;
             for slot in target[..diff].iter_mut() {
-                unsafe { ptr::drop_in_place(slot) };
+                // A destructor may reenter this consumer, so reload the live head on
+                // every iteration instead of retaining positions across user code.
+                let Some(value) = self.try_pop() else {
+                    break;
+                };
+                let old = mem::replace(slot, value);
+
+                // Publish and wake before running the old caller value destructor.
+                self.wake_producer_lazy();
+                popped += 1;
+                drop(old);
             }
-        }
+            return popped;
+        } else {
+            // The read may wrap the ring, in which case it is a tail run and a head run.
+            let start = current_head & (self.allocated_size - 1);
+            let contiguous = self.allocated_size - start;
+            let first = if contiguous > diff { diff } else { contiguous };
+            let wrapped = diff - first;
 
-        // The read may wrap the ring, in which case it is a tail run and a head run.
-        let start = current_head & (self.allocated_size - 1);
-        let contiguous = self.allocated_size - start;
-        let first = if contiguous > diff { diff } else { contiguous };
-        let wrapped = diff - first;
+            unsafe {
+                ptr::copy_nonoverlapping(self.buffer.add(start), target.as_mut_ptr(), first);
 
-        unsafe {
-            ptr::copy_nonoverlapping(self.buffer.add(start), target.as_mut_ptr(), first);
-
-            if wrapped > 0 {
-                ptr::copy_nonoverlapping(self.buffer, target.as_mut_ptr().add(first), wrapped);
+                if wrapped > 0 {
+                    ptr::copy_nonoverlapping(self.buffer, target.as_mut_ptr().add(first), wrapped);
+                }
             }
-        }
 
-        self.head
-            .store(current_head.wrapping_add(diff), Ordering::Release);
+            self.head
+                .store(current_head.wrapping_add(diff), Ordering::Release);
+        }
 
         diff
     }
@@ -261,9 +273,9 @@ impl<T> Buffer<T> {
     pub fn try_push(&self, v: T) -> Option<T> {
         let current_tail = self.tail.load(Ordering::Relaxed);
 
-        if self.shadow_head.get() + self.capacity <= current_tail {
-            self.shadow_head.set(self.head.load(Ordering::Relaxed));
-            if self.shadow_head.get() + self.capacity <= current_tail {
+        if current_tail.wrapping_sub(self.shadow_head.get()) >= self.capacity {
+            self.shadow_head.set(self.head.load(Ordering::Acquire));
+            if current_tail.wrapping_sub(self.shadow_head.get()) >= self.capacity {
                 return Some(v);
             }
         }
@@ -315,10 +327,14 @@ impl<T> Buffer<T> {
         T: Copy,
     {
         let current_tail = self.tail.load(Ordering::Relaxed);
-        let mut free = (self.shadow_head.get() + self.capacity).wrapping_sub(current_tail);
+        let mut free = self
+            .capacity
+            .saturating_sub(current_tail.wrapping_sub(self.shadow_head.get()));
         if free < src.len() {
             self.shadow_head.set(self.head.load(Ordering::Acquire));
-            free = (self.shadow_head.get() + self.capacity).wrapping_sub(current_tail);
+            free = self
+                .capacity
+                .saturating_sub(current_tail.wrapping_sub(self.shadow_head.get()));
         }
         let n = if free < src.len() { free } else { src.len() };
         if n == 0 {
@@ -342,9 +358,9 @@ impl<T> Buffer<T> {
     #[inline]
     fn try_push_sc(&self, v: T) -> Option<T> {
         let current_tail = self.tail.load(Ordering::Relaxed);
-        if self.shadow_head.get() + self.capacity <= current_tail {
+        if current_tail.wrapping_sub(self.shadow_head.get()) >= self.capacity {
             self.shadow_head.set(self.head.load(Ordering::Acquire));
-            if self.shadow_head.get() + self.capacity <= current_tail {
+            if current_tail.wrapping_sub(self.shadow_head.get()) >= self.capacity {
                 return Some(v);
             }
         }
@@ -371,12 +387,12 @@ impl<T> Buffer<T> {
         }
     }
 
-    /// Hot-path producer wake after a pop: a relaxed flag read with no fence. It can miss
-    /// a producer that is parking right now; `park_consumer` closes that gap with a
-    /// fenced check before the consumer itself sleeps. A parked producer means a full
-    /// queue, so the consumer keeps popping until it either sees the flag or runs dry.
+    /// Wake the producer after publishing a head advance. `barrier::light` orders
+    /// that publish before the parked flag check and pairs with `barrier::heavy`
+    /// between the producer's flag store and head re-check.
     #[inline]
     fn wake_producer_lazy(&self) {
+        barrier::light();
         if self.producer_parked.load(Ordering::Relaxed) != 0
             && self.producer_parked.swap(0, Ordering::Relaxed) != 0
         {
@@ -387,9 +403,8 @@ impl<T> Buffer<T> {
     #[cold]
     fn park_consumer(&self) {
         self.consumer_parked.store(1, Ordering::Relaxed);
-        // Full barrier on every thread: pairs with `barrier::light` in `wake_consumer`
-        // for our flag store and tail load, and with the SeqCst fence in `park_producer`
-        // for our earlier head stores and the producer flag load below.
+        // Pairs with `barrier::light` in `wake_consumer` for the flag store
+        // and tail re-check. The producer wake below has its own light barrier.
         barrier::heavy();
         self.wake_producer_lazy();
         if self.tail.load(Ordering::Acquire) == self.head.load(Ordering::Relaxed) {
@@ -401,9 +416,9 @@ impl<T> Buffer<T> {
     #[cold]
     fn park_producer(&self) {
         self.producer_parked.store(1, Ordering::Relaxed);
-        fence(Ordering::SeqCst);
+        barrier::heavy();
         let head = self.head.load(Ordering::Relaxed);
-        if head + self.capacity <= self.tail.load(Ordering::Relaxed) {
+        if self.tail.load(Ordering::Relaxed).wrapping_sub(head) >= self.capacity {
             park::wait(&self.producer_parked, 1);
         }
         self.producer_parked.store(0, Ordering::Relaxed);
@@ -538,13 +553,14 @@ impl<T> Drop for Buffer<T> {
         // since this is the destructor, there shouldn't be any contention... so meh?
         while self.try_pop().is_some() {}
 
-        if mem::size_of::<T>() > 0 {
+        let size = self
+            .allocated_size
+            .checked_mul(mem::size_of::<T>())
+            .expect("capacity overflow");
+        let layout =
+            Layout::from_size_align(size, mem::align_of::<T>()).expect("capacity overflow");
+        if layout.size() > 0 {
             unsafe {
-                let layout = Layout::from_size_align(
-                    self.allocated_size * mem::size_of::<T>(),
-                    mem::align_of::<T>(),
-                )
-                .unwrap();
                 dealloc(self.buffer as *mut u8, layout);
             }
         }
@@ -553,10 +569,11 @@ impl<T> Drop for Buffer<T> {
 
 /// Creates a new SPSC Queue, returning a Producer and Consumer handle
 ///
-/// Capacity specifies the size of the bounded queue to create.  Actual memory usage
-/// will be `capacity.next_power_of_two() * size_of::<T>()`, since ringbuffers with
-/// power of two sizes are more efficient to operate on (can use a bitwise AND to index
-/// into the ring instead of a more expensive modulo operator).
+/// Capacity specifies the size of the bounded queue to create. Actual ring storage
+/// rounds capacity up to the next power of two with checked arithmetic and multiplies
+/// by `size_of::<T>()`, since power-of-two ringbuffers can use a bitwise AND to index
+/// into the ring instead of a modulo operator. Zero-sized element types need no ring
+/// storage allocation.
 ///
 /// # Examples
 ///
@@ -600,17 +617,20 @@ impl<T> Drop for Buffer<T> {
 ///
 /// # Panics
 ///
-/// If the requested queue size is larger than available memory (e.g.
-/// `capacity.next_power_of_two() * size_of::<T>() > available memory` ), this function will abort
-/// with an OOM panic.
+/// Panics if rounding the capacity or computing the allocation layout overflows,
+/// or if the allocation layout exceeds `isize::MAX` bytes.
+/// Allocation failure is handled by the allocator's allocation error handler.
 pub fn make<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
+    let allocated_size = capacity
+        .checked_next_power_of_two()
+        .expect("capacity overflow");
     barrier::init();
-    let ptr = unsafe { allocate_buffer(capacity) };
+    let ptr = unsafe { allocate_buffer::<T>(allocated_size) };
 
     let arc = Arc::new(Buffer {
         buffer: ptr,
         capacity,
-        allocated_size: capacity.next_power_of_two(),
+        allocated_size,
         _padding1: [0; cacheline_pad!(3)],
 
         head: AtomicUsize::new(0),
@@ -634,16 +654,17 @@ pub fn make<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
     )
 }
 
-/// Allocates a memory buffer on the heap and returns a pointer to it
-unsafe fn allocate_buffer<T>(capacity: usize) -> *mut T {
-    let adjusted_size = capacity.next_power_of_two();
-    let size = adjusted_size
+/// Allocates storage for an already rounded power-of-two element count.
+unsafe fn allocate_buffer<T>(allocated_size: usize) -> *mut T {
+    let size = allocated_size
         .checked_mul(mem::size_of::<T>())
         .expect("capacity overflow");
+    assert!(size <= isize::MAX as usize, "capacity overflow");
 
-    let layout = Layout::from_size_align(size, mem::align_of::<T>()).unwrap();
+    let layout = Layout::from_size_align(size, mem::align_of::<T>()).expect("capacity overflow");
+    assert!(layout.size() <= isize::MAX as usize, "capacity overflow");
 
-    let ptr = if size > 0 {
+    let ptr = if layout.size() > 0 {
         raw_alloc(layout) as *mut T
     } else {
         core::ptr::NonNull::<T>::dangling().as_ptr()
@@ -700,8 +721,10 @@ impl<T> Producer<T> {
     /// Push a value, parking the thread (no CPU) while the queue is full, and wake a
     /// consumer parked in [`Consumer::pop_wait`]. Spins briefly before parking.
     ///
-    /// Only the `*_wait` calls wake a parked peer: pair `push_wait` with `pop_wait` or
-    /// `pop_n_wait`, not with the spinning `pop`/`try_pop` against a parked producer.
+    /// Pair `push_wait` with `pop_wait` or `pop_n_wait` so both sides wake a parked
+    /// peer. Bulk pops of types with destructors also wake the producer after each
+    /// transfer, including transfers completed before a destructor panics.
+    /// Spinning `pop` and `try_pop` do not wake a parked producer.
     pub fn push_wait(&self, v: T) {
         self.buffer.push_wait_spin(v, DEFAULT_SPIN)
     }
@@ -768,7 +791,10 @@ impl<T> Producer<T> {
     /// assert!(producer.size() == 1);
     /// ```
     pub fn size(&self) -> usize {
-        self.buffer.tail.load(Ordering::Acquire) - self.buffer.head.load(Ordering::Acquire)
+        self.buffer
+            .tail
+            .load(Ordering::Acquire)
+            .wrapping_sub(self.buffer.head.load(Ordering::Acquire))
     }
 
     /// Returns the available space in the queue
@@ -860,6 +886,9 @@ impl<T> Consumer<T> {
 
     /// Pop up to `target.len()` values off the queue in one go, returning how many moved.
     ///
+    /// Existing target values are dropped after replacement. If a destructor panics,
+    /// completed transfers remain consumed and every target slot remains initialized.
+    ///
     /// # Examples
     ///
     /// ```
@@ -931,7 +960,10 @@ impl<T> Consumer<T> {
     /// assert!(producer.size() == 9);
     /// ```
     pub fn size(&self) -> usize {
-        self.buffer.tail.load(Ordering::Acquire) - self.buffer.head.load(Ordering::Acquire)
+        self.buffer
+            .tail
+            .load(Ordering::Acquire)
+            .wrapping_sub(self.buffer.head.load(Ordering::Acquire))
     }
 }
 
@@ -1174,6 +1206,78 @@ mod tests {
         assert_eq!(DROPS.load(O::Relaxed), 4);
     }
 
+    struct ReentrantPayload {
+        id: usize,
+    }
+
+    static REENTRANT_DROPS: [std::sync::atomic::AtomicUsize; 4] = [
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+    ];
+
+    thread_local! {
+        static REENTRANT_CONSUMER: std::cell::RefCell<Option<Consumer<ReentrantPayload>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    impl Drop for ReentrantPayload {
+        fn drop(&mut self) {
+            let index = match self.id {
+                0 => 0,
+                1 => 1,
+                100 => 2,
+                101 => 3,
+                _ => unreachable!(),
+            };
+            REENTRANT_DROPS[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            if self.id == 100 {
+                REENTRANT_CONSUMER.with(|consumer| {
+                    let consumer = consumer.borrow();
+                    let drained = consumer.as_ref().unwrap().try_pop();
+                    assert_eq!(drained.map(|value| value.id), Some(1));
+                });
+            }
+        }
+    }
+
+    /// A target destructor can reenter try_pop; the outer bulk read must follow
+    /// the live head and leave any target slots it did not itself fill untouched.
+    #[test]
+    fn test_pop_n_destructor_can_reenter_consumer() {
+        use std::sync::atomic::Ordering as O;
+
+        for drops in &REENTRANT_DROPS {
+            drops.store(0, O::Relaxed);
+        }
+
+        let (producer, consumer) = super::make(4);
+        producer.push(ReentrantPayload { id: 0 });
+        producer.push(ReentrantPayload { id: 1 });
+        let mut target = [ReentrantPayload { id: 100 }, ReentrantPayload { id: 101 }];
+        REENTRANT_CONSUMER.with(|slot| *slot.borrow_mut() = Some(consumer));
+
+        let popped =
+            REENTRANT_CONSUMER.with(|slot| slot.borrow().as_ref().unwrap().pop_n(&mut target));
+
+        let consumer = REENTRANT_CONSUMER.with(|slot| slot.borrow_mut().take().unwrap());
+        assert_eq!(popped, 1);
+        assert_eq!(target[0].id, 0);
+        assert_eq!(target[1].id, 101);
+        assert_eq!(consumer.size(), 0);
+        assert_eq!(REENTRANT_DROPS[0].load(O::Relaxed), 0);
+        assert_eq!(REENTRANT_DROPS[1].load(O::Relaxed), 1);
+        assert_eq!(REENTRANT_DROPS[2].load(O::Relaxed), 1);
+        assert_eq!(REENTRANT_DROPS[3].load(O::Relaxed), 0);
+
+        drop(target);
+        for drops in &REENTRANT_DROPS {
+            assert_eq!(drops.load(O::Relaxed), 1);
+        }
+    }
+
     /// A bulk read that wraps the ring is a tail run plus a head run, and the two-copy path
     /// is only exercised when the head is not at zero.
     #[test]
@@ -1210,9 +1314,8 @@ mod tests {
         }
     }
 
-    extern crate time;
-    use self::time::PreciseTime;
     use std::sync::mpsc::sync_channel;
+    use std::time::Instant;
 
     #[test]
     #[ignore]
@@ -1221,20 +1324,19 @@ mod tests {
 
         let (p, c) = make(iterations as usize);
 
-        let start = PreciseTime::now();
+        let start = Instant::now();
         for i in 0..iterations as usize {
             p.push(i);
         }
         let t = c.pop();
         assert!(t == 0);
-        let end = PreciseTime::now();
-        let throughput =
-            (iterations as f64 / (start.to(end)).num_nanoseconds().unwrap() as f64) * 1000000000f64;
+        let elapsed = start.elapsed();
+        let throughput = (iterations as f64 / elapsed.as_nanos() as f64) * 1000000000f64;
         println!(
             "Spsc Throughput: {}/s -- (iterations: {} in {} ns)",
             throughput,
             iterations,
-            (start.to(end)).num_nanoseconds().unwrap()
+            elapsed.as_nanos()
         );
     }
 
@@ -1245,20 +1347,19 @@ mod tests {
 
         let (tx, rx) = sync_channel(iterations as usize);
 
-        let start = PreciseTime::now();
+        let start = Instant::now();
         for i in 0..iterations as usize {
             tx.send(i).unwrap();
         }
         let t = rx.recv().unwrap();
         assert!(t == 0);
-        let end = PreciseTime::now();
-        let throughput =
-            (iterations as f64 / (start.to(end)).num_nanoseconds().unwrap() as f64) * 1000000000f64;
+        let elapsed = start.elapsed();
+        let throughput = (iterations as f64 / elapsed.as_nanos() as f64) * 1000000000f64;
         println!(
             "Chan Throughput: {}/s -- (iterations: {} in {} ns)",
             throughput,
             iterations,
-            (start.to(end)).num_nanoseconds().unwrap()
+            elapsed.as_nanos()
         );
     }
     #[test]

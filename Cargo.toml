@@ -1,6 +1,6 @@
 [package]
 name = "ps-spsc"
-version = "0.5.1"
+version = "0.5.2"
 authors = ["Zachary Tong <zacharyjtong@gmail.com>"]
 license = "Apache-2.0"
 description = "A bounded SPSC queue"
@@ -10,6 +10,7 @@ homepage = "https://github.com/pathscale/ps-spsc"
 documentation = "https://docs.rs/ps-spsc"
 keywords = ["data-structures"]
 readme = "README.md"
+publish = ["crates-io"]
 
 # Benchmark plots and agent instructions are repository furniture, not crate content.
 exclude = ["*.png", ".claude/", ".github/", "AGENTS.md", "CLAUDE.md"]
@@ -29,5 +30,4 @@ harness = false
 
 [dev-dependencies]
 libc = "^0.2"
-criterion = "0.2.3"
-time = "0.1.39"
+criterion = "^0.5.1"
