@@ -195,19 +195,21 @@ impl<T> Buffer<T> {
         };
 
         if mem::needs_drop::<T>() {
-            for (offset, slot) in target[..diff].iter_mut().enumerate() {
-                let pos = current_head.wrapping_add(offset);
-                unsafe {
-                    let value = ptr::read(self.buffer.add(pos & (self.allocated_size - 1)));
-                    let old = ptr::read(slot);
-                    ptr::write(slot, value);
+            let mut popped = 0;
+            for slot in target[..diff].iter_mut() {
+                // A destructor may reenter this consumer, so reload the live head on
+                // every iteration instead of retaining positions across user code.
+                let Some(value) = self.try_pop() else {
+                    break;
+                };
+                let old = mem::replace(slot, value);
 
-                    // Publish the transfer before dropping the old caller value.
-                    self.head.store(pos.wrapping_add(1), Ordering::Release);
-                    self.wake_producer_lazy();
-                    drop(old);
-                }
+                // Publish and wake before running the old caller value destructor.
+                self.wake_producer_lazy();
+                popped += 1;
+                drop(old);
             }
+            return popped;
         } else {
             // The read may wrap the ring, in which case it is a tail run and a head run.
             let start = current_head & (self.allocated_size - 1);
@@ -1202,6 +1204,78 @@ mod tests {
         DROPS.store(0, O::Relaxed);
         drop(target);
         assert_eq!(DROPS.load(O::Relaxed), 4);
+    }
+
+    struct ReentrantPayload {
+        id: usize,
+    }
+
+    static REENTRANT_DROPS: [std::sync::atomic::AtomicUsize; 4] = [
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+    ];
+
+    thread_local! {
+        static REENTRANT_CONSUMER: std::cell::RefCell<Option<Consumer<ReentrantPayload>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    impl Drop for ReentrantPayload {
+        fn drop(&mut self) {
+            let index = match self.id {
+                0 => 0,
+                1 => 1,
+                100 => 2,
+                101 => 3,
+                _ => unreachable!(),
+            };
+            REENTRANT_DROPS[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            if self.id == 100 {
+                REENTRANT_CONSUMER.with(|consumer| {
+                    let consumer = consumer.borrow();
+                    let drained = consumer.as_ref().unwrap().try_pop();
+                    assert_eq!(drained.map(|value| value.id), Some(1));
+                });
+            }
+        }
+    }
+
+    /// A target destructor can reenter try_pop; the outer bulk read must follow
+    /// the live head and leave any target slots it did not itself fill untouched.
+    #[test]
+    fn test_pop_n_destructor_can_reenter_consumer() {
+        use std::sync::atomic::Ordering as O;
+
+        for drops in &REENTRANT_DROPS {
+            drops.store(0, O::Relaxed);
+        }
+
+        let (producer, consumer) = super::make(4);
+        producer.push(ReentrantPayload { id: 0 });
+        producer.push(ReentrantPayload { id: 1 });
+        let mut target = [ReentrantPayload { id: 100 }, ReentrantPayload { id: 101 }];
+        REENTRANT_CONSUMER.with(|slot| *slot.borrow_mut() = Some(consumer));
+
+        let popped =
+            REENTRANT_CONSUMER.with(|slot| slot.borrow().as_ref().unwrap().pop_n(&mut target));
+
+        let consumer = REENTRANT_CONSUMER.with(|slot| slot.borrow_mut().take().unwrap());
+        assert_eq!(popped, 1);
+        assert_eq!(target[0].id, 0);
+        assert_eq!(target[1].id, 101);
+        assert_eq!(consumer.size(), 0);
+        assert_eq!(REENTRANT_DROPS[0].load(O::Relaxed), 0);
+        assert_eq!(REENTRANT_DROPS[1].load(O::Relaxed), 1);
+        assert_eq!(REENTRANT_DROPS[2].load(O::Relaxed), 1);
+        assert_eq!(REENTRANT_DROPS[3].load(O::Relaxed), 0);
+
+        drop(target);
+        for drops in &REENTRANT_DROPS {
+            assert_eq!(drops.load(O::Relaxed), 1);
+        }
     }
 
     /// A bulk read that wraps the ring is a tail run plus a head run, and the two-copy path
