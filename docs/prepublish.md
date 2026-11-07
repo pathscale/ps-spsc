@@ -1,6 +1,6 @@
 # Local prepublish checks
 
-Before dispatching the manual publisher, review the exact commit and run these checks locally:
+Before manually dispatching the publisher from `master`, review the change and run the applicable checks locally, including `cargo publish --dry-run`:
 
 ```sh
 cargo fmt --check
