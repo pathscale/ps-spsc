@@ -11,9 +11,6 @@ use core::cell::Cell;
 use core::fmt;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-extern crate libc;
-
 mod barrier;
 mod park;
 

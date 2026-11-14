@@ -54,32 +54,33 @@ pub(crate) fn heavy() {
 
 #[cfg(all(not(miri), any(target_os = "linux", target_os = "android")))]
 mod imp {
-    const CMD_PRIVATE_EXPEDITED: libc::c_long = 1 << 3;
-    const CMD_REGISTER_PRIVATE_EXPEDITED: libc::c_long = 1 << 4;
+    use core::ffi::c_long;
+
+    #[cfg(target_arch = "x86_64")]
+    const SYS_MEMBARRIER: c_long = 324;
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    const SYS_MEMBARRIER: c_long = 283;
+    #[cfg(target_arch = "arm")]
+    const SYS_MEMBARRIER: c_long = 389;
+    #[cfg(target_arch = "x86")]
+    const SYS_MEMBARRIER: c_long = 375;
+
+    extern "C" {
+        fn syscall(num: c_long, ...) -> c_long;
+    }
+
+    const CMD_PRIVATE_EXPEDITED: c_long = 1 << 3;
+    const CMD_REGISTER_PRIVATE_EXPEDITED: c_long = 1 << 4;
 
     pub(super) fn register() -> bool {
         unsafe {
-            libc::syscall(
-                libc::SYS_membarrier,
-                CMD_REGISTER_PRIVATE_EXPEDITED,
-                0 as libc::c_long,
-            ) == 0
-                && libc::syscall(
-                    libc::SYS_membarrier,
-                    CMD_PRIVATE_EXPEDITED,
-                    0 as libc::c_long,
-                ) == 0
+            syscall(SYS_MEMBARRIER, CMD_REGISTER_PRIVATE_EXPEDITED, 0 as c_long) == 0
+                && syscall(SYS_MEMBARRIER, CMD_PRIVATE_EXPEDITED, 0 as c_long) == 0
         }
     }
 
     pub(super) fn barrier() {
-        let r = unsafe {
-            libc::syscall(
-                libc::SYS_membarrier,
-                CMD_PRIVATE_EXPEDITED,
-                0 as libc::c_long,
-            )
-        };
+        let r = unsafe { syscall(SYS_MEMBARRIER, CMD_PRIVATE_EXPEDITED, 0 as c_long) };
         // Registration succeeded, so a failure here means the kernel broke its
         // contract and the light side is no longer ordered.
         if r != 0 {

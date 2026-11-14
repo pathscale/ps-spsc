@@ -17,8 +17,6 @@ exclude = ["*.png", ".claude/", ".github/", "AGENTS.md", "CLAUDE.md"]
 
 
 
-[target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
-libc = { version = "^0.2", default-features = false }
 
 [lib]
 name = "spsc"
