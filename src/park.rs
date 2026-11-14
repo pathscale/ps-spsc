@@ -13,16 +13,32 @@ use core::sync::atomic::AtomicU32;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp {
     use super::AtomicU32;
+    use core::ffi::{c_int, c_long, c_void};
+
+    const FUTEX_WAIT: c_int = 0;
+    const FUTEX_WAKE: c_int = 1;
+    const FUTEX_PRIVATE_FLAG: c_int = 128;
+
+    #[cfg(target_arch = "x86_64")]
+    const SYS_FUTEX: c_long = 202;
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    const SYS_FUTEX: c_long = 98;
+    #[cfg(any(target_arch = "arm", target_arch = "x86"))]
+    const SYS_FUTEX: c_long = 240;
+
+    extern "C" {
+        fn syscall(num: c_long, ...) -> c_long;
+    }
 
     #[inline]
     pub(crate) fn wait(word: &AtomicU32, expected: u32) {
         unsafe {
-            libc::syscall(
-                libc::SYS_futex,
+            syscall(
+                SYS_FUTEX,
                 word as *const AtomicU32,
-                libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
+                FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
                 expected,
-                core::ptr::null::<libc::timespec>(),
+                core::ptr::null::<c_void>(),
             );
         }
     }
@@ -30,10 +46,10 @@ mod imp {
     #[inline]
     pub(crate) fn wake(word: &AtomicU32) {
         unsafe {
-            libc::syscall(
-                libc::SYS_futex,
+            syscall(
+                SYS_FUTEX,
                 word as *const AtomicU32,
-                libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
+                FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
                 1i32,
             );
         }
@@ -43,9 +59,10 @@ mod imp {
 #[cfg(target_vendor = "apple")]
 mod imp {
     use super::AtomicU32;
-    use core::ffi::{c_int, c_void};
+    use core::ffi::{c_char, c_int, c_void};
     use core::sync::atomic::{AtomicUsize, Ordering};
 
+    const RTLD_DEFAULT: *mut c_void = (-2isize) as *mut c_void;
     const UL_COMPARE_AND_WAIT: u32 = 1;
     const ULF_NO_ERRNO: u32 = 0x0100_0000;
     const OS_CLOCK_MACH_ABSOLUTE_TIME: u32 = 32;
@@ -53,6 +70,7 @@ mod imp {
     const WAIT_TIMEOUT_US: u32 = 1_000;
 
     extern "C" {
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
         fn __ulock_wait(operation: u32, addr: *mut c_void, value: u64, timeout_us: u32) -> c_int;
         fn __ulock_wake(operation: u32, addr: *mut c_void, wake_value: u64) -> c_int;
     }
@@ -67,15 +85,15 @@ mod imp {
     #[cold]
     fn resolve() {
         let wait = unsafe {
-            libc::dlsym(
-                libc::RTLD_DEFAULT,
-                b"os_sync_wait_on_address_with_timeout\0".as_ptr() as *const libc::c_char,
+            dlsym(
+                RTLD_DEFAULT,
+                b"os_sync_wait_on_address_with_timeout\0".as_ptr() as *const c_char,
             )
         };
         let wake = unsafe {
-            libc::dlsym(
-                libc::RTLD_DEFAULT,
-                b"os_sync_wake_by_address_any\0".as_ptr() as *const libc::c_char,
+            dlsym(
+                RTLD_DEFAULT,
+                b"os_sync_wake_by_address_any\0".as_ptr() as *const c_char,
             )
         };
         let (wait, wake) = if wait.is_null() || wake.is_null() {
