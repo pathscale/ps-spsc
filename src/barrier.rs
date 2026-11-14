@@ -98,7 +98,7 @@ mod imp {
     const MACH_SEND_INVALID_DEST: i32 = 0x1000_0003;
 
     extern "C" {
-        static mach_task_self_: Port;
+        fn mach_task_self() -> Port;
         fn task_threads(task: Port, list: *mut *mut Port, count: *mut u32) -> i32;
         fn thread_get_register_pointer_values(
             thread: Port,
@@ -114,7 +114,7 @@ mod imp {
     /// unexpected error. Terminated threads and dead destinations are skipped.
     fn flush() -> bool {
         unsafe {
-            let task = mach_task_self_;
+            let task = mach_task_self();
             let mut list: *mut Port = core::ptr::null_mut();
             let mut count = 0u32;
             if task_threads(task, &mut list, &mut count) != KERN_SUCCESS {
