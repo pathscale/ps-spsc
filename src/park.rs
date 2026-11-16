@@ -5,12 +5,22 @@
 //! `wait` may return spuriously; callers re-check their condition in a loop.
 //! Apple waits request a 1 ms timeout so a failed process-wide barrier cannot
 //! leave a waiter asleep indefinitely after a missed wakeup.
-//! On any other target `wait` is a spin hint and `wake` does nothing, so the
-//! blocking calls degrade to the old spin-wait instead of failing to build.
+//! On any other target, including Linux and Android architectures without a
+//! listed futex syscall number, `wait` is a spin hint and `wake` does nothing,
+//! so the blocking calls degrade to the old spin-wait instead of failing to build.
 
 use core::sync::atomic::AtomicU32;
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "arm",
+        target_arch = "x86"
+    )
+))]
 mod imp {
     use super::AtomicU32;
     use core::ffi::{c_int, c_long, c_void};
@@ -167,7 +177,19 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+#[cfg(not(any(
+    all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            all(target_arch = "x86_64", target_pointer_width = "64"),
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "arm",
+            target_arch = "x86"
+        )
+    ),
+    target_vendor = "apple"
+)))]
 mod imp {
     use super::AtomicU32;
 

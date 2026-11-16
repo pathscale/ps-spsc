@@ -12,6 +12,8 @@
 //! Terminated Apple threads and dead destinations are skipped during a flush.
 //! Other Apple flush failures use a local SeqCst fence and bounded waits;
 //! the selected barrier mode is never changed after initialization.
+//! Linux and Android architectures without a listed membarrier syscall number
+//! use the fallback, as do all other targets.
 
 use core::sync::atomic::{compiler_fence, fence, AtomicU8, Ordering};
 
@@ -52,7 +54,17 @@ pub(crate) fn heavy() {
     }
 }
 
-#[cfg(all(not(miri), any(target_os = "linux", target_os = "android")))]
+#[cfg(all(
+    not(miri),
+    any(target_os = "linux", target_os = "android"),
+    any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "arm",
+        target_arch = "x86"
+    )
+))]
 mod imp {
     use core::ffi::c_long;
 
@@ -159,7 +171,19 @@ mod imp {
 
 #[cfg(any(
     miri,
-    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+    not(any(
+        all(
+            any(target_os = "linux", target_os = "android"),
+            any(
+                all(target_arch = "x86_64", target_pointer_width = "64"),
+                target_arch = "aarch64",
+                target_arch = "riscv64",
+                target_arch = "arm",
+                target_arch = "x86"
+            )
+        ),
+        target_vendor = "apple"
+    ))
 ))]
 mod imp {
     pub(super) fn register() -> bool {
